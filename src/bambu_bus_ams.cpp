@@ -13,6 +13,24 @@ static_assert(BAMBU_BUS_AMS_NUM >= 0 && BAMBU_BUS_AMS_NUM <= 4, "invalid AMS ind
 static void bambubus_build_static_serial(void);
 static uint32_t bambubus_heartbeat_deadline = 0u;
 
+// Used only to decide whether it is safe to answer a new AMS discovery.
+// A healthy, registered device must ignore discovery broadcasts as before.
+static volatile uint32_t bambubus_last_heartbeat_tick = 0u;
+static volatile bool bambubus_has_heartbeat = false;
+
+static bool bambubus_link_stale(void)
+{
+    const uint32_t irq = irq_save_wch();
+    const bool had_heartbeat = bambubus_has_heartbeat;
+    const uint32_t last_tick = bambubus_last_heartbeat_tick;
+    irq_restore_wch(irq);
+
+    return had_heartbeat &&
+        time_diff32(time_ticks32(), last_tick) >
+        (int32_t)ms_to_ticks32(2500u);
+}
+
+
 #if BMCU_AMS_AUTO
 static uint8_t auto_ams_num = 0u;
 static bool auto_arrange_wait = false;
@@ -34,7 +52,10 @@ uint8_t bambubus_local_ams_index(void)
 
 void bambubus_heartbeat_seen_fast(void)
 {
-    bambubus_heartbeat_deadline = time_ticks32() + ms_to_ticks32(1000u);
+    const uint32_t now = time_ticks32();
+    bambubus_last_heartbeat_tick = now;
+    bambubus_has_heartbeat = true;
+    bambubus_heartbeat_deadline = now + ms_to_ticks32(1000u);
 }
 
 bool package_check_crc16(uint8_t *data, int data_length)
@@ -56,6 +77,8 @@ void bambubus_init()
 #endif
     bambubus_build_static_serial();
     bambubus_heartbeat_deadline = 0u;
+    bambubus_last_heartbeat_tick = 0u;
+    bambubus_has_heartbeat = false;
 }
 
 void package_add_crc(uint8_t *data, int send_data_length) // 为数据包添加crc校验
@@ -958,7 +981,22 @@ void get_package_online_detect(unsigned char *buf, int length)
 
     if (buf[5] == 0x00u)
     {
-        if (have_registered) return;
+        if (have_registered)
+        {
+#if defined(BMCU_REJOIN_STALE) && BMCU_REJOIN_STALE
+            // Do not disrupt a working AMS. Re-answer discovery only after
+            // printer heartbeat has been absent for > 2.5 seconds.
+            if (!bambubus_link_stale()) return;
+            online_detect_reset();
+#if BMCU_AMS_AUTO
+            // The host can reassign our AMS address during the new handshake.
+            auto_ams_num = 0u;
+            auto_arrange_wait = false;
+#endif
+#else
+            return;
+#endif
+        }
 
 #if !BMCU_AMS_AUTO
         if (online_detect_phase == 0u)
@@ -1209,7 +1247,14 @@ void get_package_long_packge_serial_number(unsigned char *buf, int length)
 //0x46 // 70
 //0x50 // 80
 //0x5A // 90
-unsigned char long_packge_version_version_and_name_AMS08[] = {0x57, 0x06, 0x00, 0x01 , // verison number
+// The version field is read as a little-endian byte sequence by A1 mini.
+// Report 01.00.06.87 only in the experimental build. This is a claimed
+// version, not an implementation of an official AMS firmware.
+#if defined(BMCU_AMS_VERSION_01000687) && BMCU_AMS_VERSION_01000687
+unsigned char long_packge_version_version_and_name_AMS08[] = {0x57, 0x06, 0x00, 0x01 , // reported 01.00.06.87
+#else
+unsigned char long_packge_version_version_and_name_AMS08[] = {0x00, 0x00, 0x00, 0x0B , // original reported version
+#endif
                                                               0x41, 0x4D, 0x53, 0x30, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 //unsigned char long_packge_version_version_and_name_AMS2PRO[] = {
 //    0x00, 0x00, 0x00, 0x5A,
